@@ -1,0 +1,12 @@
+schema_version: 1
+resolved:
+  - name: cmake
+    version: 3.28.3-1build7
+    provider: apt
+    package: cmake
+    env_var: CMAKE_MIN_VERSION
+  - name: opencv
+    version: 4.6.0+dfsg-13.1ubuntu1
+    provider: apt
+    package: libopencv-dev
+    env_var: OPENCV_VERSION

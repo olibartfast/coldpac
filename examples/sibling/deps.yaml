@@ -1,0 +1,16 @@
+schema_version: 1
+packages:
+  - name: neuriplo
+    kind: sibling
+    wanted: v0.10.0
+    providers: [fetchcontent]
+    repo: olibartfast/neuriplo
+    ref: 1664b4547f905860386213b2aa2adc29ce91369f
+    env_var: NEURIPLO_VERSION
+  - name: videocapture
+    kind: sibling
+    wanted: v0.6.0
+    providers: [fetchcontent]
+    repo: olibartfast/videocapture
+    ref: ebc7208d2b3de485d76aa7c06261ac80b0a22eaa
+    env_var: VIDEOCAPTURE_VERSION

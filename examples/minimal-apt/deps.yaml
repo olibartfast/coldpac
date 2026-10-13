@@ -1,0 +1,14 @@
+schema_version: 1
+packages:
+  - name: opencv
+    kind: system-library
+    wanted: ==4.6.0
+    providers: [apt]
+    package: libopencv-dev
+    env_var: OPENCV_VERSION
+  - name: cmake
+    kind: tool
+    wanted: ">=3.10"
+    providers: [apt]
+    package: cmake
+    env_var: CMAKE_MIN_VERSION

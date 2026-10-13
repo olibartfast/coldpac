@@ -1,0 +1,17 @@
+schema_version: 1
+resolved:
+  - name: glog
+    version: 0.6.0
+    provider: apt
+    package: libgoogle-glog-dev
+    env_var: GLOG_MIN_VERSION
+  - name: onnxruntime-gpu
+    version: 1.19.2
+    provider: custom-url
+    sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    env_var: ONNX_RUNTIME_VERSION
+  - name: opencv
+    version: 4.6.0
+    provider: apt
+    package: libopencv-dev
+    env_var: OPENCV_VERSION

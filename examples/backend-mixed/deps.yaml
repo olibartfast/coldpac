@@ -1,0 +1,22 @@
+schema_version: 1
+packages:
+  - name: onnxruntime-gpu
+    kind: backend-binary
+    wanted: ==1.19.2
+    providers: [custom-url]
+    url: https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-gpu-1.19.2.tgz
+    sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    env_var: ONNX_RUNTIME_VERSION
+  - name: opencv
+    kind: system-library
+    wanted: ">=4.6.0"
+    providers: [apt, conan, vcpkg]
+    preferred: apt
+    package: libopencv-dev
+    env_var: OPENCV_VERSION
+  - name: glog
+    kind: system-library
+    wanted: ">=0.6.0"
+    providers: [apt, conan, vcpkg]
+    package: libgoogle-glog-dev
+    env_var: GLOG_MIN_VERSION

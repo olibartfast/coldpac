@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""coldpac: manager of package managers.
+
+One manifest per project (deps.yaml), one lockfile (deps.lock), one
+generated versions.env, one status view across apt, snap, conan, vcpkg,
+custom-url, and fetchcontent.
+
+Stdlib only. Python 3.12 compatible. ASCII only.
+
+Exit codes for status/check-updates: 0 clean, 2 updates available,
+1 error or drift.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+
+VERSION = "0.1.0"
+
+PROVIDERS = ("apt", "snap", "conan", "vcpkg", "custom-url", "fetchcontent")
+KINDS = ("system-library", "backend-binary", "tool", "sibling")
+SCHEMA_VERSION = 1
+
+SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+REF_RE = re.compile(r"^[0-9a-f]{40}$")
+TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+# --- minimal YAML subset -------------------------------------------------
+# Supports the shapes coldpac emits: top-level mapping, nested mappings via
+# indentation (spaces), lists of scalars or maps, flow lists [a, b],
+# quoted and plain scalars, and # comments. Not a general YAML parser.
+
+def _strip_quotes(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _parse_scalar(s):
+    s = s.strip()
+    if s.startswith("[") and s.endswith("]"):
+        inner = s[1:-1].strip()
+        if not inner:
+            return []
+        parts = []
+        cur = ""
+        in_q = None
+        for ch in inner:
+            if in_q:
+                cur += ch
+                if ch == in_q:
+                    in_q = None
+            elif ch in ("'", '"'):
+                in_q = ch
+                cur += ch
+            elif ch == ",":
+                parts.append(_parse_scalar(cur))
+                cur = ""
+            else:
+                cur += ch
+        parts.append(_parse_scalar(cur))
+        return parts
+    return _strip_quotes(s)
+
+
+def _indent_of(line):
+    n = 0
+    for ch in line:
+        if ch == " ":
+            n += 1
+        else:
+            break
+    return n
+
+
+def parse_simple_yaml(text):
+    """Parse our constrained YAML subset into plain dicts/lists/strings."""
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.split("#", 1)[0] if _hash_starts_comment(raw) else raw
+        if stripped.strip() == "":
+            continue
+        lines.append((_indent_of(stripped), stripped.strip()))
+    if not lines:
+        return {}
+    obj, pos = _parse_block(lines, 0, lines[0][0])
+    return obj
+
+
+def _hash_starts_comment(raw):
+    # A '#' starts a comment only outside quotes; good enough: treat a '#'
+    # preceded by space or at line start as a comment.
+    in_q = None
+    for i, ch in enumerate(raw):
+        if in_q:
+            if ch == in_q:
+                in_q = None
+        elif ch in ("'", '"'):
+            in_q = ch
+        elif ch == "#" and (i == 0 or raw[i - 1] in (" ", "\t")):
+            return True
+    return False
+
+
+def _parse_block(lines, pos, indent):
+    # Decide map vs list by first line at this indent.
+    if pos < len(lines) and lines[pos][1].startswith("- ") or lines[pos][1] == "-":
+        return _parse_list(lines, pos, indent)
+    return _parse_map(lines, pos, indent)
+
+
+def _parse_map(lines, pos, indent):
+    d = {}
+    while pos < len(lines):
+        ind, content = lines[pos]
+        if ind < indent:
+            break
+        if ind > indent:
+            raise ValueError("bad indentation at: %r" % content)
+        if content.startswith("- ") or content == "-":
+            break
+        if ":" not in content:
+            raise ValueError("expected key: value at: %r" % content)
+        key, _, rest = content.partition(":")
+        key = _strip_quotes(key.strip())
+        rest = rest.strip()
+        if rest != "":
+            d[key] = _parse_scalar(rest)
+            pos += 1
+        else:
+            # nested block or empty
+            if pos + 1 < len(lines) and lines[pos + 1][0] > indent:
+                child, pos = _parse_block(lines, pos + 1, lines[pos + 1][0])
+                d[key] = child
+            else:
+                d[key] = ""
+                pos += 1
+    return d, pos
+
+
+def _parse_list(lines, pos, indent):
+    items = []
+    while pos < len(lines):
+        ind, content = lines[pos]
+        if ind != indent:
+            break
+        if not (content.startswith("- ") or content == "-"):
+            break
+        rest = content[1:].strip()
+        if rest == "":
+            if pos + 1 < len(lines) and lines[pos + 1][0] > indent:
+                child, pos = _parse_block(lines, pos + 1, lines[pos + 1][0])
+                items.append(child)
+            else:
+                items.append("")
+                pos += 1
+        elif ":" in rest and not rest.startswith("["):
+            # inline first map entry: "- name: foo" plus continuation lines
+            m = {}
+            k, _, v = rest.partition(":")
+            m[_strip_quotes(k.strip())] = _parse_scalar(v)
+            pos += 1
+            while pos < len(lines) and lines[pos][0] > indent:
+                ind2, content2 = lines[pos]
+                if content2.startswith("- ") or content2 == "-":
+                    break
+                if ":" not in content2:
+                    raise ValueError("expected key: value at: %r" % content2)
+                k2, _, v2 = content2.partition(":")
+                k2 = _strip_quotes(k2.strip())
+                v2 = v2.strip()
+                if v2 != "":
+                    m[k2] = _parse_scalar(v2)
+                    pos += 1
+                else:
+                    if pos + 1 < len(lines) and lines[pos + 1][0] > ind2:
+                        child, pos = _parse_block(lines, pos + 1, lines[pos + 1][0])
+                        m[k2] = child
+                    else:
+                        m[k2] = ""
+                        pos += 1
+            items.append(m)
+        else:
+            items.append(_parse_scalar(rest))
+            pos += 1
+    return items, pos
+
+
+def dump_simple_yaml(obj, indent=0):
+    """Emit constrained YAML for dicts/lists/scalars."""
+    pad = " " * indent
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out.append("%s%s:" % (pad, k))
+                out.append(dump_simple_yaml(v, indent + 2))
+            else:
+                out.append("%s%s: %s" % (pad, k, _dump_scalar(v)))
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                keys = list(item.keys())
+                first = keys[0]
+                out.append("%s- %s: %s" % (pad, first, _dump_value_inline(item[first])))
+                for k in keys[1:]:
+                    v = item[k]
+                    if isinstance(v, (dict, list)):
+                        out.append("%s  %s:" % (pad, k))
+                        out.append(dump_simple_yaml(v, indent + 4))
+                    else:
+                        out.append("%s  %s: %s" % (pad, k, _dump_scalar(v)))
+            elif isinstance(item, list):
+                out.append("%s- %s" % (pad, _dump_flow(item)))
+            else:
+                out.append("%s- %s" % (pad, _dump_scalar(item)))
+    else:
+        out.append(pad + _dump_scalar(obj))
+    return "\n".join(out)
+
+
+def _dump_scalar(v):
+    if v is None:
+        return '""'
+    s = str(v)
+    if s == "" or any(c in s for c in ":#'\"{}[],&*") or s != s.strip():
+        return '"%s"' % s.replace('"', '\\"')
+    return s
+
+
+def _dump_value_inline(v):
+    if isinstance(v, list):
+        return _dump_flow(v)
+    if isinstance(v, dict):
+        return "{}"
+    return _dump_scalar(v)
+
+
+def _dump_flow(items):
+    return "[" + ", ".join(_dump_scalar(i) for i in items) + "]"
+
+
+# --- versions ------------------------------------------------------------
+
+def _norm_version(v):
+    s = str(v).strip()
+    if s[:1] == "v" and len(s) > 1 and s[1].isdigit():
+        s = s[1:]
+    # debian revision "+dfsg-..." and similar: compare upstream part first
+    s = re.split(r"[+~-]", s, 1)[0]
+    return s
+
+
+def _ver_key(v):
+    parts = []
+    for tok in re.split(r"[.]", _norm_version(v)):
+        m = re.match(r"(\d+)(.*)$", tok)
+        if m:
+            parts.append((0, int(m.group(1)), m.group(2)))
+        else:
+            parts.append((1, 0, tok))
+    return parts
+
+
+def _cmp_versions(a, b):
+    ka, kb = _ver_key(a), _ver_key(b)
+    if ka < kb:
+        return -1
+    if ka > kb:
+        return 1
+    return 0
+
+
+def satisfies(version, spec):
+    """Check version against spec like '==1.2.3', '>=4.6.0', '>=1.0,<2.0'."""
+    spec = str(spec).strip()
+    if spec == "" or spec == "*":
+        return True
+    # bare version means ==
+    clauses = [c.strip() for c in spec.split(",")]
+    for clause in clauses:
+        m = re.match(r"^(==|!=|>=|<=|>|<)?\s*(.+)$", clause)
+        if not m:
+            return False
+        op = m.group(1) or "=="
+        want = m.group(2).strip()
+        cmp = _cmp_versions(version, want)
+        if op == "==" and cmp != 0:
+            return False
+        if op == "!=" and cmp == 0:
+            return False
+        if op == ">=" and cmp < 0:
+            return False
+        if op == "<=" and cmp > 0:
+            return False
+        if op == ">" and cmp <= 0:
+            return False
+        if op == "<" and cmp >= 0:
+            return False
+    return True
+
+
+def _dpkg_compare(a, op, b):
+    """Use dpkg if present, else internal compare. op in gt,lt,eq,ge,le."""
+    dpkg = shutil.which("dpkg")
+    if dpkg:
+        r = subprocess.run([dpkg, "--compare-versions", str(a), op, str(b)],
+                           capture_output=True)
+        return r.returncode == 0
+    c = _cmp_versions(a, b)
+    return {"eq": c == 0, "gt": c > 0, "lt": c < 0,
+            "ge": c >= 0, "le": c <= 0}[op]
+
+
+# --- manifest model ------------------------------------------------------
+
+def load_manifest(path):
+    try:
+        with open(path, "r", encoding="ascii") as h:
+            text = h.read()
+    except UnicodeDecodeError:
+        return None, ["non-ASCII content: %s" % path]
+    try:
+        data = parse_simple_yaml(text)
+    except ValueError as e:
+        return None, ["YAML parse error in %s: %s" % (path, e)]
+    if not isinstance(data, dict):
+        return None, ["%s: top level must be a mapping" % path]
+    return data, []
+
+
+def load_lock(path):
+    if not os.path.exists(path):
+        return {"schema_version": SCHEMA_VERSION, "resolved": []}, []
+    try:
+        with open(path, "r", encoding="ascii") as h:
+            text = h.read()
+    except UnicodeDecodeError:
+        return None, ["non-ASCII content: %s" % path]
+    try:
+        data = parse_simple_yaml(text)
+    except ValueError as e:
+        return None, ["YAML parse error in %s: %s" % (path, e)]
+    if not isinstance(data, dict):
+        return None, ["%s: top level must be a mapping" % path]
+    return data, []
+
+
+def validate_manifest(data):
+    errors = []
+    if not isinstance(data, dict):
+        return ["manifest top level must be a mapping"]
+    if data.get("schema_version") not in (1, "1", "1.0"):
+        errors.append("schema_version must be 1")
+    pkgs = data.get("packages")
+    if not isinstance(pkgs, list):
+        return errors + ["packages must be a list"]
+    seen = set()
+    for i, p in enumerate(pkgs):
+        where = "packages[%d]" % i
+        if not isinstance(p, dict):
+            errors.append("%s must be a mapping" % where)
+            continue
+        name = p.get("name")
+        if not name or not isinstance(name, str):
+            errors.append("%s missing required field: name" % where)
+            continue
+        if name in seen:
+            errors.append("duplicate package name: %s" % name)
+        seen.add(name)
+        kind = p.get("kind")
+        if kind not in KINDS:
+            errors.append("%s: kind must be one of %s" % (name, "/".join(KINDS)))
+        wanted = p.get("wanted")
+        if not wanted or not isinstance(wanted, str):
+            errors.append("%s missing required field: wanted" % name)
+        provs = p.get("providers")
+        if not isinstance(provs, list) or not provs:
+            errors.append("%s: providers must be a non-empty list" % name)
+            continue
+        for pr in provs:
+            if pr not in PROVIDERS:
+                errors.append("%s: unknown provider %r" % (name, pr))
+        pref = p.get("preferred")
+        if pref is not None and pref not in provs:
+            errors.append("%s: preferred %r not in providers" % (name, pref))
+        if "custom-url" in provs:
+            if not p.get("url"):
+                errors.append("%s: custom-url provider requires url" % name)
+            sha = p.get("sha256", "")
+            if not SHA_RE.match(str(sha)):
+                errors.append("%s: custom-url provider requires 64-hex sha256" % name)
+        if "fetchcontent" in provs:
+            if not p.get("repo"):
+                errors.append("%s: fetchcontent provider requires repo" % name)
+            ref = str(p.get("ref", ""))
+            if not (REF_RE.match(ref) or TAG_RE.match(ref)):
+                errors.append("%s: fetchcontent requires 40-char SHA ref or vX.Y.Z tag" % name)
+        if p.get("kind") == "sibling" and "fetchcontent" not in provs:
+            errors.append("%s: sibling kind requires fetchcontent provider" % name)
+    return errors
+
+
+def validate_lock(data, manifest=None):
+    errors = []
+    if not isinstance(data, dict):
+        return ["lockfile top level must be a mapping"]
+    if data.get("schema_version") not in (1, "1", "1.0"):
+        errors.append("schema_version must be 1")
+    resolved = data.get("resolved")
+    if resolved is None:
+        return errors  # empty lock allowed
+    if not isinstance(resolved, list):
+        return errors + ["resolved must be a list"]
+    manifest_providers = {}
+    if isinstance(manifest, dict) and isinstance(manifest.get("packages"), list):
+        for p in manifest["packages"]:
+            if isinstance(p, dict) and p.get("name"):
+                manifest_providers[p["name"]] = p.get("providers", [])
+    seen = set()
+    for i, r in enumerate(resolved):
+        where = "resolved[%d]" % i
+        if not isinstance(r, dict):
+            errors.append("%s must be a mapping" % where)
+            continue
+        name = r.get("name")
+        if not name:
+            errors.append("%s missing required field: name" % where)
+            continue
+        if name in seen:
+            errors.append("duplicate lock entry: %s" % name)
+        seen.add(name)
+        if not r.get("version"):
+            errors.append("%s missing required field: version" % name)
+        prov = r.get("provider")
+        if prov not in PROVIDERS:
+            errors.append("%s: unknown provider %r" % (name, prov))
+        elif name in manifest_providers and prov not in manifest_providers[name]:
+            errors.append("%s: lock provider %r not in manifest providers %s "
+                          "(refusing to silently mix providers)" %
+                          (name, prov, manifest_providers[name]))
+    return errors
+
+
+# --- provider probes -----------------------------------------------------
+
+def _run(cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except FileNotFoundError:
+        return 127, "not installed"
+    except subprocess.TimeoutExpired:
+        return 1, "timeout"
+
+
+def apt_installed(package):
+    code, out = _run(["dpkg-query", "-W", "-f=${Version}", package])
+    if code == 0 and out.strip():
+        return out.strip()
+    return None
+
+
+def apt_candidate(package):
+    code, out = _run(["apt-cache", "policy", package])
+    if code != 0:
+        return None
+    m = re.search(r"Candidate:\s*(\S+)", out)
+    if m and m.group(1) != "(none)":
+        return m.group(1)
+    return None
+
+
+def snap_installed(package):
+    code, out = _run(["snap", "list", package])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == package:
+            return parts[1]
+    return None
+
+
+def snap_candidate(package):
+    code, out = _run(["snap", "info", package])
+    if code != 0:
+        return None
+    m = re.search(r"stable:\s*(\S+)", out)
+    if m:
+        return m.group(1)
+    return None
+
+
+def conan_installed(ref):
+    code, out = _run(["conan", "list", "packages:%s*" % ref])
+    if code != 0:
+        return None
+    m = re.search(r"(%s\S*)" % re.escape(ref), out)
+    return m.group(1) if m else None
+
+
+def vcpkg_installed(package):
+    code, out = _run(["vcpkg", "list"])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        if line.startswith(package + ":"):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    return None
+
+
+def url_reachable(url, offline):
+    if offline:
+        return None, "offline mode: no network calls"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return str(resp.status), None
+    except Exception as e:  # noqa: BLE001 - report, do not crash
+        return None, str(e)
+
+
+def git_remote_tags(repo, offline):
+    if offline:
+        return None, "offline mode: no network calls"
+    code, out = _run(["git", "ls-remote", "--tags",
+                      "https://github.com/%s.git" % repo])
+    if code != 0:
+        return None, out.strip()[:200]
+    tags = re.findall(r"refs/tags/(v[\d][\w.\-+]*)\b", out)
+    return tags, None
+
+
+def probe_installed(entry):
+    """Best-effort installed-version probe across listed providers."""
+    provs = entry.get("providers", [])
+    pkg = entry.get("package") or entry.get("name")
+    for pr in provs:
+        if pr == "apt":
+            v = apt_installed(pkg)
+            if v:
+                return v, pr
+        elif pr == "snap":
+            v = snap_installed(pkg)
+            if v:
+                return v, pr
+        elif pr == "conan":
+            v = conan_installed(pkg)
+            if v:
+                return v, pr
+        elif pr == "vcpkg":
+            v = vcpkg_installed(pkg)
+            if v:
+                return v, pr
+        elif pr == "custom-url":
+            cache = os.path.expanduser("~/.cache/coldpac")
+            marker = os.path.join(cache, entry["name"] + ".version")
+            if os.path.exists(marker):
+                with open(marker, encoding="ascii", errors="replace") as h:
+                    return h.read().strip(), pr
+        elif pr == "fetchcontent":
+            build = os.environ.get("COLDPAC_DEPS_DIR", "")
+            if build:
+                marker = os.path.join(build, entry["name"] + ".version")
+                if os.path.exists(marker):
+                    with open(marker, encoding="ascii", errors="replace") as h:
+                        return h.read().strip(), pr
+    return None, None
+
+
+def probe_candidate(entry, offline):
+    provs = entry.get("providers", [])
+    pkg = entry.get("package") or entry.get("name")
+    for pr in provs:
+        if pr == "apt":
+            v = apt_candidate(pkg)
+            if v:
+                return v, pr
+        elif pr == "snap":
+            v = snap_candidate(pkg)
+            if v:
+                return v, pr
+        elif pr == "fetchcontent" and entry.get("repo"):
+            tags, _ = git_remote_tags(entry["repo"], offline)
+            if tags:
+                tags.sort(key=_ver_key)
+                return tags[-1], pr
+    return None, None
+
+
+# --- versions.env projection ---------------------------------------------
+
+def derive_env_var(name):
+    s = re.sub(r"[^A-Za-z0-9]+", "_", str(name).upper()).strip("_")
+    return s + "_VERSION"
+
+
+def export_versions_env(lock_data, out_path):
+    lines = [
+        "# Generated by coldpac. Do not edit by hand.",
+        "# Source of truth: deps.lock. Regenerate with: coldpac export.",
+        "",
+    ]
+    resolved = lock_data.get("resolved") or []
+    for r in sorted(resolved, key=lambda e: str(e.get("name"))):
+        var = r.get("env_var") or derive_env_var(r.get("name", ""))
+        lines.append("%s=%s" % (var, r.get("version", "")))
+    lines.append("")
+    with open(out_path, "w", encoding="ascii", newline="\n") as h:
+        h.write("\n".join(lines))
+    return out_path
+
+
+# --- import --------------------------------------------------------------
+
+KNOWN_IMPORTS = {
+    # env key: (manifest name, kind, providers, package-or-repo)
+    "OPENCV_VERSION": ("opencv", "system-library", ["apt", "conan", "vcpkg", "custom-url"], "libopencv-dev"),
+    "OPENCV_MIN_VERSION": ("opencv", "system-library", ["apt", "conan", "vcpkg"], "libopencv-dev"),
+    "OPENCV_REVIEWED_VERSION": ("opencv", "system-library", ["apt"], "libopencv-dev"),
+    "GSTREAMER_VERSION": ("gstreamer", "system-library", ["apt"], "libgstreamer1.0-dev"),
+    "GSTREAMER_REVIEWED_VERSION": ("gstreamer", "system-library", ["apt"], "libgstreamer1.0-dev"),
+    "FFMPEG_VERSION": ("ffmpeg", "system-library", ["apt"], "libavcodec-dev"),
+    "FFMPEG_REVIEWED_VERSION": ("ffmpeg", "system-library", ["apt"], "libavcodec-dev"),
+    "CMAKE_VERSION": ("cmake", "tool", ["apt"], "cmake"),
+    "CMAKE_MIN_VERSION": ("cmake", "tool", ["apt"], "cmake"),
+    "CMAKE_REVIEWED_VERSION": ("cmake", "tool", ["apt"], "cmake"),
+    "GLOG_MIN_VERSION": ("glog", "system-library", ["apt", "conan", "vcpkg"], "libgoogle-glog-dev"),
+    "CMAKE_MIN_VERSION_DUP": ("cmake", "tool", ["apt"], "cmake"),
+    "ONNX_RUNTIME_VERSION": ("onnxruntime-gpu", "backend-binary", ["custom-url"], None),
+    "TENSORRT_VERSION": ("tensorrt", "backend-binary", ["custom-url"], None),
+    "PYTORCH_VERSION": ("libtorch", "backend-binary", ["custom-url"], None),
+    "OPENVINO_VERSION": ("openvino", "backend-binary", ["custom-url"], None),
+    "TENSORFLOW_VERSION": ("tensorflow", "backend-binary", ["custom-url"], None),
+    "LITERT_VERSION": ("litert", "backend-binary", ["custom-url"], None),
+    "EXECUTORCH_VERSION": ("executorch", "backend-binary", ["custom-url"], None),
+    "TVM_VERSION": ("tvm", "backend-binary", ["custom-url"], None),
+    "GGML_VERSION": ("ggml", "backend-binary", ["custom-url"], None),
+    "MIGRAPHX_VERSION": ("migraphx", "backend-binary", ["custom-url"], None),
+    "CACTUS_VERSION": ("cactus", "backend-binary", ["custom-url"], None),
+    "LLAMACPP_VERSION": ("llamacpp", "backend-binary", ["custom-url"], None),
+    "CUDA_VERSION": ("cuda", "tool", ["apt", "custom-url"], None),
+    "DALI_VERSION": ("dali", "backend-binary", ["custom-url"], None),
+    "NEURIPLO_VERSION": ("neuriplo", "sibling", ["fetchcontent"], "olibartfast/neuriplo"),
+    "VIDEOCAPTURE_VERSION": ("videocapture", "sibling", ["fetchcontent"], "olibartfast/videocapture"),
+    "NEURIPLO_TASKS_VERSION": ("neuriplo-tasks", "sibling", ["fetchcontent"], "olibartfast/neuriplo-tasks"),
+    "NEURIPLO_KSERVE_CLIENT_VERSION": ("neuriplo-kserve-client", "sibling", ["fetchcontent"], "olibartfast/neuriplo-kserve-client"),
+}
+
+SKIP_KEYS = {"UBUNTU_RELEASE", "DOCKER_BASE_IMAGE", "DOCKER_USER",
+             "DOCKER_WORKDIR", "OPENVINO_FULL_ID"}
+
+
+def parse_versions_env(path):
+    entries = []
+    with open(path, "r", encoding="ascii", errors="strict") as h:
+        for lineno, raw in enumerate(h, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError("%s:%d: expected KEY=VALUE" % (path, lineno))
+            k, _, v = line.partition("=")
+            entries.append((k.strip(), v.strip().strip("'\"")))
+    return entries
+
+
+def import_versions_env(env_path):
+    """Translate a versions.env file into manifest entries + notes."""
+    entries = parse_versions_env(env_path)
+    packages = []
+    notes = []
+    for key, value in entries:
+        if key in SKIP_KEYS:
+            notes.append("%s: metadata, not a package; skipped" % key)
+            continue
+        if key in KNOWN_IMPORTS:
+            name, kind, provs, pkg = KNOWN_IMPORTS[key]
+            op = ">=" if key.endswith("_MIN_VERSION") else "=="
+            entry = {"name": name, "kind": kind, "wanted": "%s%s" % (op, value),
+                     "providers": provs, "env_var": key}
+            if pkg and provs == ["fetchcontent"] or kind == "sibling":
+                entry["repo"] = pkg
+                entry["ref"] = value
+            elif pkg:
+                entry["package"] = pkg
+            if "custom-url" in provs and kind != "sibling":
+                entry["url"] = "TODO: pin download URL for %s %s" % (name, value)
+                entry["sha256"] = "TODO: 64-hex sha256"
+                notes.append("%s: custom-url coordinates need pinning" % key)
+            packages.append(entry)
+        else:
+            base = re.sub(r"(_MIN_VERSION|_REVIEWED_VERSION|_VERSION|_FULL_ID)$", "", key)
+            name = base.lower().replace("_", "-")
+            op = ">=" if key.endswith("_MIN_VERSION") else "=="
+            packages.append({"name": name, "kind": "system-library",
+                             "wanted": "%s%s" % (op, value),
+                             "providers": ["apt"], "env_var": key})
+            notes.append("%s: unmapped key, generic apt fallback; review" % key)
+    # dedupe by name, last wins
+    merged = {}
+    for p in packages:
+        merged[p["name"]] = p
+    return {"schema_version": 1, "packages": list(merged.values())}, notes
+
+
+# --- commands ------------------------------------------------------------
+
+def cmd_validate(args):
+    manifest, errs = load_manifest(args.manifest)
+    if errs:
+        for e in errs:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    errors = validate_manifest(manifest)
+    lock, lock_errs = load_lock(args.lock)
+    errors += lock_errs
+    if not lock_errs:
+        errors += validate_lock(lock, manifest)
+    if errors:
+        for e in errors:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    print("coldpac validate ok: %d packages" % len(manifest.get("packages", [])))
+    return 0
+
+
+def _lock_index(lock):
+    idx = {}
+    for r in lock.get("resolved") or []:
+        if isinstance(r, dict) and r.get("name"):
+            idx[r["name"]] = r
+    return idx
+
+
+def cmd_status(args):
+    manifest, errs = load_manifest(args.manifest)
+    if errs:
+        for e in errs:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    errors = validate_manifest(manifest)
+    lock, lock_errs = load_lock(args.lock)
+    errors += lock_errs
+    if not lock_errs:
+        errors += validate_lock(lock, manifest)
+    if errors:
+        for e in errors:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    idx = _lock_index(lock)
+    worst = 0  # 0 clean, 2 updates, 1 error/drift
+    print("| package | wanted | locked | installed | candidate | status |")
+    print("| --- | --- | --- | --- | --- | --- |")
+    for p in manifest.get("packages", []):
+        name = p["name"]
+        wanted = p.get("wanted", "")
+        locked = idx.get(name, {}).get("version", "(unlocked)")
+        installed, iprov = probe_installed(p)
+        candidate, _ = probe_candidate(p, args.offline)
+        if installed is None:
+            state = "missing"
+            worst = max(worst, 1)
+            inst = "(not found)"
+        elif not satisfies(installed, wanted):
+            state = "drift: installed %s vs wanted %s" % (installed, wanted)
+            worst = max(worst, 1)
+            inst = "%s (%s)" % (installed, iprov)
+        elif isinstance(locked, str) and locked.startswith("("):
+            state = "unlocked"
+            worst = max(worst, 1)
+            inst = "%s (%s)" % (installed, iprov)
+        else:
+            inst = "%s (%s)" % (installed, iprov)
+            state = "ok"
+        cand = candidate or "(unknown)"
+        if candidate and installed and _dpkg_compare(candidate, "gt", installed):
+            if worst == 0:
+                worst = 2
+            if state == "ok":
+                state = "update available"
+        print("| %s | `%s` | `%s` | %s | %s | %s |" %
+              (name, wanted, locked, inst, cand, state))
+    return worst
+
+
+def cmd_check_updates(args):
+    args.lock = args.lock  # same shape as status
+    return cmd_status(args)
+
+
+def cmd_export(args):
+    lock, errs = load_lock(args.lock)
+    if errs:
+        for e in errs:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    if not lock.get("resolved"):
+        print("ERROR: lockfile has no resolved entries: %s" % args.lock, file=sys.stderr)
+        return 1
+    export_versions_env(lock, args.out)
+    print("coldpac export ok: %s" % args.out)
+    return 0
+
+
+def cmd_import(args):
+    try:
+        manifest, notes = import_versions_env(args.env)
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    out = dump_simple_yaml(manifest) + "\n"
+    if args.out:
+        with open(args.out, "w", encoding="ascii", newline="\n") as h:
+            h.write(out)
+        print("coldpac import ok: %s" % args.out)
+    else:
+        sys.stdout.write(out)
+    for n in notes:
+        print("note: %s" % n, file=sys.stderr)
+    return 0
+
+
+def cmd_resolve(args):
+    manifest, errs = load_manifest(args.manifest)
+    if errs:
+        for e in errs:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    errors = validate_manifest(manifest)
+    if errors:
+        for e in errors:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    lock, lock_errs = load_lock(args.lock)
+    if lock_errs:
+        for e in lock_errs:
+            print("ERROR: %s" % e, file=sys.stderr)
+        return 1
+    idx = _lock_index(lock)
+    resolved = []
+    for p in manifest.get("packages", []):
+        name = p["name"]
+        if name in idx and not args.force:
+            resolved.append(idx[name])
+            continue
+        # pick exactly one winner: preferred, else first listed
+        winner = p.get("preferred") or p["providers"][0]
+        if winner not in p["providers"]:
+            print("ERROR: %s: winner %r not in providers (refusing to mix)" % (name, winner),
+                  file=sys.stderr)
+            return 1
+        entry = {"name": name, "provider": winner,
+                 "version": _wanted_version(p.get("wanted", ""))}
+        if p.get("package"):
+            entry["package"] = p["package"]
+        if p.get("env_var"):
+            entry["env_var"] = p["env_var"]
+        if winner == "custom-url":
+            entry["sha256"] = p.get("sha256", "")
+        if winner == "fetchcontent":
+            entry["repo"] = p.get("repo", "")
+            entry["ref"] = p.get("ref", "")
+        resolved.append(entry)
+    lock["schema_version"] = 1
+    lock["resolved"] = resolved
+    with open(args.lock, "w", encoding="ascii", newline="\n") as h:
+        h.write(dump_simple_yaml(lock) + "\n")
+    print("coldpac resolve ok: %d entries -> %s" % (len(resolved), args.lock))
+    return 0
+
+
+def _wanted_version(spec):
+    m = re.search(r"([vV]?\d[\w.\-+~]*)", str(spec))
+    return m.group(1) if m else str(spec)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="coldpac",
+                                 description="manager of package managers")
+    ap.add_argument("--version", action="version", version="coldpac " + VERSION)
+    ap.add_argument("--manifest", default="deps.yaml")
+    ap.add_argument("--lock", default="deps.lock")
+    ap.add_argument("--offline", action="store_true",
+                    help="perform zero network calls")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("validate")
+    sub.add_parser("status")
+    sub.add_parser("check-updates")
+    pe = sub.add_parser("export")
+    pe.add_argument("--out", default="versions.env")
+    pi = sub.add_parser("import")
+    pi.add_argument("--env", default="versions.env")
+    pi.add_argument("--out", default="")
+    pr = sub.add_parser("resolve")
+    pr.add_argument("--force", action="store_true",
+                    help="re-resolve even locked entries")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.cmd == "validate":
+        return cmd_validate(args)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "check-updates":
+        return cmd_check_updates(args)
+    if args.cmd == "export":
+        return cmd_export(args)
+    if args.cmd == "import":
+        return cmd_import(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
