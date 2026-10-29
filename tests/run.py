@@ -100,6 +100,25 @@ class ResolveTest(unittest.TestCase):
                 text = h.read()
             self.assertIn("7:6.1.1-3ubuntu5", text)
 
+    def test_status_flags_stale_custom_url_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            m = os.path.join(td, "deps.yaml")
+            with open(m, "w", encoding="ascii") as h:
+                h.write("schema_version: 1\npackages:\n"
+                        "  - name: backend\n    kind: backend-binary\n"
+                        '    wanted: ==1.0\n    providers: [custom-url]\n'
+                        "    url: https://example.invalid/b.tgz\n"
+                        "    sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+            lock = os.path.join(td, "deps.lock")
+            with open(lock, "w", encoding="ascii") as h:
+                h.write("schema_version: 1\nresolved:\n"
+                        "  - name: backend\n    version: '1.0'\n"
+                        "    provider: custom-url\n"
+                        "    sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+            r = run_coldpac("--manifest", m, "--lock", lock, "--offline", "status")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("stale lock", r.stdout)
+
 
 class ImportTest(unittest.TestCase):
     def test_import_minimal_env(self):

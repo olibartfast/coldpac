@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. Tags are `vX.Y.Z`.
 
+## [0.1.2] - 2026-10-29
+
+- `status` flags stale custom-url locks (manifest sha256 differs from lock:
+  re-run resolve). Needed for pin-change detection.
+
 ## [0.1.1] - 2026-10-29
 
 - Fix `resolve` truncating Debian epoch versions (`==7:6.1.1-3ubuntu5`

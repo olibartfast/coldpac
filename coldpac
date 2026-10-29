@@ -768,6 +768,14 @@ def cmd_status(args):
         name = p["name"]
         wanted = p.get("wanted", "")
         locked = idx.get(name, {}).get("version", "(unlocked)")
+        if (isinstance(idx.get(name), dict)
+                and idx[name].get("provider") == "custom-url"
+                and "sha256" in p
+                and p["sha256"] != idx[name].get("sha256")):
+            print("| %s | `%s` | `%s` | - | - | stale lock (sha256 changed, re-run resolve) |"
+                  % (name, wanted, locked))
+            worst = max(worst, 1)
+            continue
         installed, iprov = probe_installed(p)
         candidate, _ = probe_candidate(p, args.offline)
         if installed is None:
