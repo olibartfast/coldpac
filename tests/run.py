@@ -85,6 +85,21 @@ class ResolveTest(unittest.TestCase):
             r2 = run_coldpac("--manifest", m, "--lock", lock, "validate")
             self.assertEqual(r2.returncode, 0, msg=r2.stderr)
 
+    def test_resolve_keeps_debian_epoch(self):
+        with tempfile.TemporaryDirectory() as td:
+            m = os.path.join(td, "deps.yaml")
+            with open(m, "w", encoding="ascii") as h:
+                h.write("schema_version: 1\npackages:\n"
+                        "  - name: ffmpeg\n    kind: system-library\n"
+                        '    wanted: "==7:6.1.1-3ubuntu5"\n'
+                        "    providers: [apt]\n")
+            lock = os.path.join(td, "deps.lock")
+            r = run_coldpac("--manifest", m, "--lock", lock, "resolve")
+            self.assertEqual(r.returncode, 0, msg=r.stderr)
+            with open(lock, encoding="ascii") as h:
+                text = h.read()
+            self.assertIn("7:6.1.1-3ubuntu5", text)
+
 
 class ImportTest(unittest.TestCase):
     def test_import_minimal_env(self):

@@ -883,7 +883,7 @@ def cmd_resolve(args):
 
 
 def _wanted_version(spec):
-    m = re.search(r"([vV]?\d[\w.\-+~]*)", str(spec))
+    m = re.search(r"([vV]?\d[\w.:\-+~]*)", str(spec))
     return m.group(1) if m else str(spec)
 
 
